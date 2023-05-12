@@ -42,33 +42,34 @@ contract SwapDemo is Ownable, ReentrancyGuard {
 
     struct SwapOrder {
         State status; // 单子状态
-        uint256 exchangeRate; // 最小汇率 1:1000 , 即0.1%
-        uint256 tokenAExchangeMin; // 最低保证金 根据maker的保证金
-        uint256 tokenAExchangeMax; // 超过保证金，需要maker补单
-        uint256 tokenBMakerNeedAdd; // maker需要充值的tokenB数量
-        uint256 tokenBBalance; // maker的保证金（可换汇数量
+        uint16 exchangeRate; // 最小汇率 1:1000 , 即0.1%
         uint256 makeTime; // 发单时间
-        uint256 takerTime; // 吃单时间
+        uint256 tokenAExchangeMin; // 下限
+        uint256 tokenAExchangeMax; // 上限
+        uint256 tokenBBalance; // maker的保证金（可换汇数量
         address tokenA;
         address tokenB;
         address maker;
     }
-
     // 订单编号(从1开始
-    uint256 public orderId = 1;
+    uint32 public orderId = 1;
     // 平台手续费收款账户
     address public swapFeeWallet;
-    // 未成交,已成交,已撤单,待充值
-    enum State { Pending, Closed, Canceled, Waiting}
+    // 未成交,已撤单
+    enum State { Pending, Canceled}
     // 企业用户列表
     mapping(address => bool) public vipUsers;
-    // 订单列表
+    // 挂单列表
     mapping(uint256 => SwapOrder) public swapOrders;
     // 平台手续费（token=>rate)
     mapping(address => uint256) public swapFees;
 
     modifier onlyVip(address maker) {
         require(vipUsers[maker], "not vip");
+        _;
+    }
+    modifier onlyMaker(uint32 swapOrderId, address maker) {
+        require(swapOrders[swapOrderId].maker == maker, "auth err");
         _;
     }
 
@@ -78,11 +79,16 @@ contract SwapDemo is Ownable, ReentrancyGuard {
         require(!(size > 0), "anti contract");
         _;
     }
-
-    event MakeOrder(uint256, address);
-    event UpdateSwapOrder(uint256);
-    event Cancel(uint256);
-    event TakeOrder(uint256);
+    // 挂单 订单id，挂单时间，挂单上下限，保证金，maker
+    event MakeOrder(uint32, uint256, uint256, uint256, uint256, address);
+    // 吃单 订单id，吃单时间，吃单数量，taker
+    event TakeOrder(uint32, uint256, uint256, address);
+    // 更新挂单 订单id，汇率，更新时间，挂单上下限，tokenB
+    event UpdateSwap(uint32, uint16, uint256, uint256, uint256, address);
+    // 撤单 订单id，撤单时间
+    event Cancel(uint32, uint256);
+    // 充值 订单id，充值数量，充值token
+    event AddOrderToken(uint32, uint256, address);
 
     // 更改每个token对应的手续费
     function updateSwapFees(uint256[] memory fees, address[] memory tokens) external onlyOwner {
@@ -104,7 +110,7 @@ contract SwapDemo is Ownable, ReentrancyGuard {
 
     // 发单
     function make(
-        uint256 rate,
+        uint16 rate,
         uint256 tokenBAmount,
         uint256 min,
         uint256 max,
@@ -134,98 +140,89 @@ contract SwapDemo is Ownable, ReentrancyGuard {
     unchecked {
         orderId++;
     }
-        emit MakeOrder(orderId-1, msg.sender);
+        emit MakeOrder(orderId-1, block.timestamp, min, max, tokenBAmount, msg.sender);
     }
 
     // 编辑单子
     function updateSwapOrder(
-        uint256 swapOrderId,
-        uint256 rate,
+        uint16 rate,
+        uint32 swapOrderId,
         uint256 tokenAMin,
         uint256 tokenAMax,
         address swapDest
-    ) external {
-        require(swapOrders[swapOrderId].maker == msg.sender, "auth err");
+    ) external onlyMaker(swapOrderId, msg.sender) {
         require(swapOrders[swapOrderId].status == State.Pending, "status err");
+        // 如果更换了tokenB 需要退款并且充值
+        address tokenB = swapOrders[swapOrderId].tokenB;
+        uint256 balance = swapOrders[swapOrderId].tokenBBalance;
+        if (tokenB != swapDest) {
+            if (balance > 0) {
+                IERC20(tokenB).transfer(msg.sender, balance);
+            }
+        }
         swapOrders[swapOrderId].exchangeRate = rate;
         swapOrders[swapOrderId].tokenAExchangeMin = tokenAMin;
         swapOrders[swapOrderId].tokenAExchangeMax = tokenAMax;
         swapOrders[swapOrderId].tokenB = swapDest;
-        emit UpdateSwapOrder(swapOrderId);
+        emit UpdateSwap(swapOrderId, rate, block.timestamp, tokenAMin, tokenAMax, tokenB);
     }
 
     // 换汇操作
-    function swap(uint256 swapIndex, uint256 tokenAAmount, address taker) private returns (bool) {
-        uint256 min = swapOrders[swapIndex].tokenAExchangeMin;
-        uint256 max = swapOrders[swapIndex].tokenAExchangeMax;
-        require(tokenAAmount >= min && tokenAAmount <= max, "amount err");
+    function swap(uint32 swapOrderId, uint256 tokenAAmount, address taker) private returns (bool) {
+        address tokenB = swapOrders[swapOrderId].tokenB;
+        bool suc = IERC20(tokenB).transferFrom(address(this), msg.sender, tokenAAmount);
+        require(suc, "transfer err");
+
         // check非交易状态
-        if (swapOrders[swapIndex].status != State.Pending) {
+        if (swapOrders[swapOrderId].status != State.Pending) {
             return false;
         }
-        // maker的TokenB保证金
-        uint256 securityFund = swapOrders[swapIndex].tokenBBalance;
-        address tokenB = swapOrders[swapIndex].tokenB;
-
-        uint256 rate = swapOrders[swapIndex].exchangeRate;
+        uint256 rate = swapOrders[swapOrderId].exchangeRate;
         uint256 tokenBExchangeAmount = tokenAAmount / rate / 1000;
-        if (tokenBExchangeAmount > securityFund) {
-            // 需要maker充值的tokenB数量
-            uint256 needAddAmount = tokenBExchangeAmount - securityFund;
-            swapOrders[swapIndex].takerTime = block.timestamp;
-            swapOrders[swapIndex].tokenBMakerNeedAdd = needAddAmount;
-            swapOrders[swapIndex].status = State.Waiting;
-            return true;
-        }
+        // 平台费率
         uint256 swapFee = swapFees[tokenB];
         uint256 swapFeePay = tokenBExchangeAmount * swapFee / 100;
-        // taker should receive tokenB amount
+        // taker收到的tokenB
         uint256 takerReceive = tokenBExchangeAmount - swapFeePay;
         IERC20(tokenB).transfer(taker, takerReceive);
         IERC20(tokenB).transfer(swapFeeWallet, swapFeePay);
+
         // update order
-        swapOrders[swapIndex].status = State.Closed;
-        emit TakeOrder(orderId);
+        swapOrders[swapOrderId].tokenBBalance -= tokenBExchangeAmount;
+        emit TakeOrder(swapOrderId, block.timestamp, takerReceive, msg.sender);
         return true;
     }
 
     // 撤单
-    function cancelOrder(uint256 swapOrderId) external {
-        require(swapOrders[swapOrderId].maker == msg.sender, "auth err");
-        // 只有等待吃单的order才可以撤单
+    function cancelOrder(uint32 swapOrderId) external onlyMaker(swapOrderId, msg.sender){
         require(swapOrders[swapOrderId].status == State.Pending, "state err");
         swapOrders[swapOrderId].status = State.Canceled;
-        emit Cancel(swapOrderId);
+        // 退款
+        if (swapOrders[swapOrderId].tokenBBalance > 0) {
+            IERC20(swapOrders[swapOrderId].tokenB).transfer(msg.sender, swapOrders[swapOrderId].tokenBBalance);
+            swapOrders[swapOrderId].tokenBBalance = 0;
+        }
+        emit Cancel(swapOrderId, block.timestamp);
     }
 
     // 吃单
-    function take(uint256 swapOrderId, uint256 tokenAAmount) external nonReentrant antiContract(msg.sender) {
+    function take(uint32 swapOrderId, uint256 tokenAAmount) external nonReentrant antiContract(msg.sender) {
         uint256 min = swapOrders[swapOrderId].tokenAExchangeMin;
         uint256 max = swapOrders[swapOrderId].tokenAExchangeMax;
-        address tokenB = swapOrders[swapOrderId].tokenB;
         require(tokenAAmount > min && tokenAAmount < max, "amount err");
-
-        bool suc = IERC20(tokenB).transferFrom(msg.sender, address(this), tokenAAmount);
-        require(suc, "transfer err");
 
         bool swapSuc = swap(swapOrderId, tokenAAmount, msg.sender);
         require(swapSuc, "swap fail");
     }
 
-    // 补单充值
-    function addSecurityDeposit(uint256 swapOrderId, uint256 addAmount) external {
-        require(swapOrders[swapOrderId].maker == msg.sender, "auth err");
-        require(swapOrders[swapOrderId].status == State.Waiting, "status err");
-        require(addAmount == swapOrders[swapOrderId].tokenBMakerNeedAdd, "amount err");
-        // transfer to contract( need approve 手动
+    // 充值
+    function addSecurityDeposit(uint32 swapOrderId, uint256 addAmount) external nonReentrant antiContract(msg.sender) onlyMaker(swapOrderId, msg.sender) {
+        // transfer to contract(need approve
         address tokenB = swapOrders[swapOrderId].tokenB;
         bool suc = IERC20(tokenB).transferFrom(msg.sender, address(this), addAmount);
-        require(suc, "transfer err");
+        require(suc, "add err");
         // update order
-        swapOrders[swapOrderId].tokenBMakerNeedAdd = 0;
         swapOrders[swapOrderId].tokenBBalance += addAmount;
-        swapOrders[swapOrderId].takerTime = block.timestamp;
-        swapOrders[swapOrderId].status = State.Closed;
-        emit TakeOrder(swapOrderId);
+        emit AddOrderToken(swapOrderId, addAmount, tokenB);
     }
 }
